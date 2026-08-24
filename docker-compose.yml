@@ -1,0 +1,33 @@
+# Local development: the AI service alone.
+#
+#   cp .env.example .env   # set AI_SERVICE_API_KEY and OLLAMA_MODEL
+#   docker compose up --build
+#
+# Ollama is NOT part of this stack. It runs on the host (`ollama serve`), which
+# is how it also works in production: an external provider reached over HTTP.
+# The container talks to the host through host.docker.internal.
+
+services:
+  ai:
+    build:
+      context: .
+    container_name: arthiq-ai
+    env_file:
+      # Optional: .env is gitignored, so a fresh checkout (CI, a new clone) has
+      # none. The service still starts, stays healthy, and refuses every
+      # internal call until a service key is configured.
+      - path: .env
+        required: false
+    environment:
+      # Inside a container, localhost is the container. Point Ollama at the
+      # host instead, unless .env already names a reachable URL.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      UVICORN_ARGS: "--reload"
+    ports:
+      - "8100:8100"
+    volumes:
+      # Live reload for local development; remove for a production-like run.
+      - ./app:/app/app
+    extra_hosts:
+      # Linux hosts do not resolve host.docker.internal by default.
+      - "host.docker.internal:host-gateway"

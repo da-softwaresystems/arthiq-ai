@@ -1,0 +1,112 @@
+name: AI Service CI
+
+# Format, lint and test the AI service on Python 3.12.
+#
+# The suite is deterministic and hermetic: no Ollama, no Gemini key, no network
+# and no service containers. Live-provider tests carry the `integration` marker
+# and are deselected by the default pytest options.
+
+on:
+  push:
+    branches:
+      - main
+      - development
+      - "feature/**"
+  pull_request:
+    branches:
+      - main
+      - development
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run.
+concurrency:
+  group: ai-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  quality:
+    name: Ruff and Pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Show resolved environment
+        run: |
+          python --version
+          ruff --version
+          pytest --version
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Ruff lint
+        run: ruff check --output-format=github .
+
+      - name: Pytest
+        # No AI_PROVIDER, no keys: the suite must pass with an empty
+        # environment or it is not hermetic.
+        run: pytest -v
+
+      - name: Confirm no live provider test ran
+        # A test that reaches Ollama or Gemini must never be part of CI. If the
+        # integration marker were dropped, this step fails.
+        run: |
+          if pytest --collect-only -q | grep -q "tests/integration"; then
+            echo "::error::A live-provider test is in the default selection."
+            exit 1
+          fi
+          echo "Default run excludes live-provider tests."
+
+      - name: Verify no secrets are tracked
+        # A committed .env or key file must fail the build, not be discovered
+        # later. .env.example holds placeholders only and is fine.
+        run: |
+          tracked=$(git ls-files \
+            '.env' '.env.*' \
+            '*.pem' '*.key' \
+            '*credentials*.json' '*service-account*.json' \
+            | grep -v '^\.env\.example$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::Secret-bearing files are tracked in git:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "No secret-bearing files are tracked."
+
+      - name: Verify the service holds no trading authority
+        # A structural check, not a policy statement: the AI service must not
+        # gain a broker client, a database driver or user authentication.
+        run: |
+          pattern='^[[:space:]]*(from|import)[[:space:]]+(firebase|firebase_admin|sqlalchemy|asyncpg|psycopg[0-9]*|alembic|redis|smartapi|SmartApi|google\.generativeai|google\.genai)'
+          if grep -rnE "$pattern" app/; then
+            echo "::error::app/ imports a broker, database or user-auth dependency."
+            exit 1
+          fi
+          echo "No broker, database or user-auth imports in app/."
