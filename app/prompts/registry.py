@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from app.prompts.base import Prompt
 from app.prompts.technical_analysis import TECHNICAL_ANALYSIS_V1
+from app.prompts.technical_news import TECHNICAL_NEWS_V1
 
-_REGISTERED: tuple[Prompt, ...] = (TECHNICAL_ANALYSIS_V1,)
+_REGISTERED: tuple[Prompt, ...] = (TECHNICAL_ANALYSIS_V1, TECHNICAL_NEWS_V1)
 
 PROMPTS: dict[str, Prompt] = {prompt.version_id: prompt for prompt in _REGISTERED}
 
