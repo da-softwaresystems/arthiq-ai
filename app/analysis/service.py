@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import UTC, datetime
 
 from app.analysis.errors import safe_reason, translate_provider_error
 from app.analysis.output import parse_decision_draft
 from app.context.builder import ContextLimits, build_context
 from app.core.config import Settings
+from app.core.deadline import ProviderBudget, resolve_budget
 from app.core.exceptions import ValidationError
 from app.core.redaction import truncate
 from app.domain.analysis import AnalysisRequest
@@ -50,24 +52,41 @@ class AnalysisService:
         self._limits = ContextLimits.from_settings(settings)
 
     async def analyze(
-        self, request: AnalysisRequest, *, request_id: str | None = None
+        self,
+        request: AnalysisRequest,
+        *,
+        request_id: str | None = None,
+        deadline_ms: int | None = None,
     ) -> TradingDecision:
         """Produce one decision, or raise an :class:`AppError` describing why not.
+
+        ``deadline_ms`` is how long the caller says it will still wait. The
+        provider budget is clamped to it, so this service never keeps a model
+        running for an answer that has already been abandoned.
 
         Raises :class:`~app.core.exceptions.AppError` only - provider failures
         are translated here so that no caller of this method has to know what an
         Ollama connection error is.
         """
+        # Monotonic, and started before any work: the time spent resolving a
+        # prompt and building the context is time the caller has spent waiting
+        # too, so it comes out of the same budget.
+        started = time.monotonic()
+
         prompt = self._resolve_prompt(request)
         context = build_context(request, self._limits)
         rendered = prompt.render(context.render())
+
+        budget = self._budget(deadline_ms, elapsed_seconds=time.monotonic() - started)
+        if budget.expired:
+            self._raise_expired(request, deadline_ms)
 
         completion_request = CompletionRequest(
             system=rendered.system,
             user=rendered.user,
             max_output_tokens=self._settings.ai_max_output_tokens,
             temperature=self._settings.ai_temperature,
-            timeout_seconds=self._settings.ai_request_timeout_seconds,
+            timeout_seconds=budget.seconds,
             depth=request.depth,
         )
 
@@ -89,6 +108,8 @@ class AnalysisService:
                     "depth": request.depth.value,
                     "error_code": exc.code,
                     "reason": safe_reason(exc, self._settings),
+                    "deadline_ms": deadline_ms,
+                    "effective_timeout_seconds": round(budget.seconds, 3),
                     "outcome": "failure",
                 },
             )
@@ -119,6 +140,8 @@ class AnalysisService:
                 "depth": request.depth.value,
                 "prompt_version": prompt.version_id,
                 "latency_ms": result.latency_ms,
+                "deadline_ms": deadline_ms,
+                "effective_timeout_seconds": round(budget.seconds, 3),
                 "decision": decision.decision.value,
                 "confidence": decision.confidence,
                 "prompt_tokens": result.usage.prompt_tokens if result.usage else None,
@@ -137,6 +160,40 @@ class AnalysisService:
                 f"Unknown prompt version: {exc.version_id}",
                 details={"field": "prompt_version"},
             ) from exc
+
+    def _budget(self, deadline_ms: int | None, *, elapsed_seconds: float) -> ProviderBudget:
+        """The provider budget for this request, clamped to the caller's deadline."""
+        return resolve_budget(
+            configured_timeout_seconds=self._settings.ai_request_timeout_seconds,
+            deadline_ms=deadline_ms,
+            elapsed_seconds=elapsed_seconds,
+            safety_margin_seconds=self._settings.ai_deadline_safety_margin_seconds,
+        )
+
+    def _raise_expired(self, request: AnalysisRequest, deadline_ms: int | None) -> None:
+        """Fail fast on an expired deadline, with the normal timeout semantics.
+
+        No provider call is made: the caller stopped waiting before we started,
+        so the cheapest correct answer is an immediate one.
+        """
+        exc = ProviderTimeoutError(
+            "Caller deadline expired before the provider was called",
+            provider=self._provider.name,
+            model=self._provider.model_for(request.depth),
+        )
+        logger.warning(
+            "Analysis abandoned: deadline expired",
+            extra={
+                "provider": self._provider.name,
+                "symbol": request.symbol,
+                "depth": request.depth.value,
+                "error_code": exc.code,
+                "deadline_ms": deadline_ms,
+                "effective_timeout_seconds": 0.0,
+                "outcome": "failure",
+            },
+        )
+        raise translate_provider_error(exc) from exc
 
     async def _complete(self, completion_request: CompletionRequest) -> CompletionResult:
         """Run the provider call under a hard timeout.

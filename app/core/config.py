@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     ai_max_output_tokens: int = Field(default=768, gt=0, le=8192)
     #: Decisions should be reproducible; 0.0 unless deliberately raised.
     ai_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    #: Subtracted from a caller-announced deadline so this service gives up
+    #: fractionally before the caller does. Being first to time out is what
+    #: turns a dead socket into a reported error the backend can act on.
+    ai_deadline_safety_margin_ms: int = Field(default=250, ge=0, le=5_000)
 
     # -- Context bounds ---------------------------------------------------
     #: The context builder truncates to these limits. They exist so a prompt
@@ -124,6 +128,10 @@ class Settings(BaseSettings):
     @classmethod
     def _strip_trailing_slash(cls, value: str) -> str:
         return value.rstrip("/")
+
+    @property
+    def ai_deadline_safety_margin_seconds(self) -> float:
+        return self.ai_deadline_safety_margin_ms / 1000.0
 
     @property
     def is_production(self) -> bool:

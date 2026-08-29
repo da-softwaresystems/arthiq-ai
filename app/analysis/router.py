@@ -8,11 +8,12 @@ intended caller is the Arthiq backend.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Header, status
 
 from app.analysis.dependencies import get_analysis_service, provider_dependency
 from app.analysis.schemas import AnalyzeRequest, AnalyzeResponse, ProviderReadinessResponse
 from app.analysis.service import AnalysisService
+from app.core.deadline import DEADLINE_HEADER, parse_deadline_ms
 from app.core.middleware import current_request_id
 from app.core.security import verify_service_key
 from app.prompts import DEFAULT_PROMPT_ID, available_prompts
@@ -37,14 +38,25 @@ router = APIRouter(
 async def analyze(
     request: AnalyzeRequest,
     service: AnalysisService = Depends(get_analysis_service),
+    # Taken as a raw string, not an int: an unparseable optional header must
+    # not turn a valid analysis request into a 422. See parse_deadline_ms.
+    deadline_header: str | None = Header(default=None, alias=DEADLINE_HEADER),
 ) -> AnalyzeResponse:
     """Return one analytical opinion for the supplied snapshot.
+
+    ``X-Deadline-Ms`` announces how long the backend will still wait. The
+    provider budget is clamped to it, so this service stops working when the
+    caller stops waiting.
 
     The decision is advisory. This service executes nothing; what the backend
     does with the answer - including ignoring it - is entirely the backend's
     decision.
     """
-    return await service.analyze(request, request_id=current_request_id())
+    return await service.analyze(
+        request,
+        request_id=current_request_id(),
+        deadline_ms=parse_deadline_ms(deadline_header),
+    )
 
 
 @router.get(
